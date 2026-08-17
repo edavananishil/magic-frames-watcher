@@ -5,7 +5,9 @@ import re
 
 import requests
 
-URL = "https://www.district.in/movies/magic-frames-cinemas-kakkanad-in-kochi-CD1102417"
+TARGET_URL = "https://www.district.in/movies/magic-frames-cinemas-kakkanad-in-kochi-CD1102417"
+READER_URL = "https://r.jina.ai/" + TARGET_URL
+
 NOT_STARTED_TEXT = "No shows playing at the moment"
 
 # The theatre-specific block on the page sits between these two markers.
@@ -24,6 +26,16 @@ DEFAULT_STATE = {
     "last_change_notified_hash": None,  # hash we already alerted about
 }
 
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.google.com/",
+}
+
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -37,12 +49,34 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
+def fetch_page():
+    # Attempt 1: direct request with realistic browser-like headers.
+    try:
+        resp = requests.get(TARGET_URL, timeout=20, headers=BROWSER_HEADERS)
+        if resp.status_code == 200:
+            return resp.text
+        print(f"Direct fetch returned status {resp.status_code}, trying proxy fallback...")
+    except requests.RequestException as e:
+        print(f"Direct fetch failed ({e}), trying proxy fallback...")
+
+    # Attempt 2: fetch via r.jina.ai, a free reader proxy that fetches the
+    # page through its own servers and returns cleaned text/markdown.
+    resp = requests.get(
+        READER_URL,
+        timeout=30,
+        headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
 def fetch_scoped_section(html):
     start = html.find(START_MARKER)
     end = html.find(END_MARKER)
     if start == -1 or end == -1 or end <= start:
-        # Markers not found (page structure changed) - fall back to
-        # hashing the whole page so we still catch SOMETHING changed.
+        # Markers not found (page structure changed, or proxy output
+        # differs) - fall back to hashing the whole page so we still
+        # catch SOMETHING changed.
         return html
     return html[start:end]
 
@@ -63,7 +97,7 @@ def notify(title, message, priority="urgent", tags="movie_camera,tada"):
             "Title": title,
             "Priority": priority,
             "Tags": tags,
-            "Click": URL,
+            "Click": TARGET_URL,
         },
         timeout=15,
     )
@@ -76,9 +110,7 @@ def main():
         print("Already marked as started. Skipping.")
         return
 
-    resp = requests.get(URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-    resp.raise_for_status()
-    html = resp.text
+    html = fetch_page()
 
     section = normalize(fetch_scoped_section(html))
     current_hash = hash_of(section)
