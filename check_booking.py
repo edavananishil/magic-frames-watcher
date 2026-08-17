@@ -4,6 +4,7 @@ import os
 import re
 
 import requests
+from curl_cffi import requests as cffi_requests
 
 TARGET_URL = "https://www.district.in/movies/magic-frames-cinemas-kakkanad-in-kochi-CD1102417"
 READER_URL = "https://r.jina.ai/" + TARGET_URL
@@ -11,9 +12,6 @@ READER_URL = "https://r.jina.ai/" + TARGET_URL
 NOT_STARTED_TEXT = "No shows playing at the moment"
 
 # The theatre-specific block on the page sits between these two markers.
-# Everything before START_MARKER (nav bars, footers) and after END_MARKER
-# (city-wide movie lists, FAQ boilerplate) is noisy and unrelated to this
-# specific cinema, so we scope our change-detection to just this window.
 START_MARKER = "Get directions"
 END_MARKER = "Where is Magic Frames Cinemas"
 
@@ -21,9 +19,9 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
 STATE_FILE = "state.json"
 
 DEFAULT_STATE = {
-    "status": "not_started",   # "not_started" -> "started"
-    "last_hash": None,         # hash of the scoped section, last run
-    "last_change_notified_hash": None,  # hash we already alerted about
+    "status": "not_started",
+    "last_hash": None,
+    "last_change_notified_hash": None,
 }
 
 BROWSER_HEADERS = {
@@ -50,23 +48,36 @@ def save_state(state):
 
 
 def fetch_page():
-    # Attempt 1: direct request with realistic browser-like headers.
+    # Attempt 1: curl_cffi impersonating a real Chrome browser's TLS/network
+    # fingerprint. This gets past bot-detection systems that block based on
+    # low-level connection signatures, not just headers.
+    try:
+        resp = cffi_requests.get(TARGET_URL, impersonate="chrome124", timeout=20)
+        if resp.status_code == 200:
+            print("Fetched via curl_cffi (Chrome impersonation).")
+            return resp.text
+        print(f"curl_cffi fetch returned status {resp.status_code}, trying next method...")
+    except Exception as e:
+        print(f"curl_cffi fetch failed ({e}), trying next method...")
+
+    # Attempt 2: plain requests with realistic browser-like headers.
     try:
         resp = requests.get(TARGET_URL, timeout=20, headers=BROWSER_HEADERS)
         if resp.status_code == 200:
+            print("Fetched via plain requests.")
             return resp.text
         print(f"Direct fetch returned status {resp.status_code}, trying proxy fallback...")
     except requests.RequestException as e:
         print(f"Direct fetch failed ({e}), trying proxy fallback...")
 
-    # Attempt 2: fetch via r.jina.ai, a free reader proxy that fetches the
-    # page through its own servers and returns cleaned text/markdown.
+    # Attempt 3: r.jina.ai reader proxy as a last resort.
     resp = requests.get(
         READER_URL,
         timeout=30,
         headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
     )
     resp.raise_for_status()
+    print("Fetched via r.jina.ai proxy.")
     return resp.text
 
 
@@ -74,9 +85,6 @@ def fetch_scoped_section(html):
     start = html.find(START_MARKER)
     end = html.find(END_MARKER)
     if start == -1 or end == -1 or end <= start:
-        # Markers not found (page structure changed, or proxy output
-        # differs) - fall back to hashing the whole page so we still
-        # catch SOMETHING changed.
         return html
     return html[start:end]
 
@@ -130,8 +138,6 @@ def main():
         save_state(state)
         return
 
-    # Still shows the "not started" text, but check if ANYTHING else in
-    # that section changed (new date field, extra note, wording tweak, etc.)
     if state["last_hash"] is not None and current_hash != state["last_hash"]:
         if current_hash != state.get("last_change_notified_hash"):
             print("Section changed but booking text still present - alerting.")
